@@ -1,124 +1,62 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-import plotly.graph_objects as go
-import numpy as np
-
-# 1. 페이지 설정
-st.set_page_config(page_title="주간 상승률 분석기", layout="wide")
-
-# 2. 종목 및 기본 설정
-tickers_info = {
-    '005930.KS': {'name': '삼성전자', 'color': '#0057D8', 'width': 6},
-    'CL=F': {'name': 'WTI 원유', 'color': '#E67E22', 'width': 2},
-    'DX-Y.NYB': {'name': '달러지수(x5)', 'color': '#34495E', 'width': 2},
-    'SI=F': {'name': '글로벌 은', 'color': '#BDC3C7', 'width': 2}
-}
-
-@st.cache_data(ttl=30)
 def get_weekly_performance_data():
     combined_df = []
     current_stats = {}
-    
+
     for sym, info in tickers_info.items():
         try:
-            # 1개월치 15분봉 데이터 로드
-            df = yf.download(sym, period='1mo', interval='15m', progress=False)
+            # 1개월치 데이터 로드
+            df = yf.download(sym, period='1mo', interval='15m', progress=False, group_by='ticker')
             if df.empty: continue
             
-            close = df['Close'][sym] if isinstance(df.columns, pd.MultiIndex) else df['Close']
-            close = close.copy()
+            close = df['Close'].iloc[:, 0].copy() if isinstance(df.columns, pd.MultiIndex) else df['Close'].copy()
             
-            # 시간대 KST 변환
+            # KST 변환
             if close.index.tz is None:
                 close.index = close.index.tz_localize('UTC').tz_convert('Asia/Seoul')
             else:
                 close.index = close.index.tz_convert('Asia/Seoul')
 
-            # --- [핵심] 월요일 아침 첫 가격 기준 수익률 계산 ---
-            # 연도-주차별로 그룹화하여 해당 주의 첫 번째 '유효한' 가격(시가)을 찾음
+            # --- [수정] 금요일 오후 2시 가격을 기준점으로 설정 ---
+            # 각 주차별로 그룹화
             year_week = close.index.strftime('%Y-%U')
             
-            def get_first_valid(series):
-                valid = series.dropna()
-                return valid.iloc[0] if not valid.empty else np.nan
+            def get_friday_2pm_price(group):
+                # 이전 주(week-1)의 금요일 14:00 데이터를 찾아야 하지만, 
+                # 간단하게 "해당 그룹(주차)의 첫 데이터" 대신 "직전 영업일 특정 시간"을 타겟팅합니다.
+                # 여기서는 사용자 요청에 따라 '기준 가격'을 계산하는 로직을 적용합니다.
+                
+                # 해당 주차의 월요일 09:00 시가 대신, 
+                # 데이터 프레임 전체에서 해당 시점 이전의 가장 가까운 금요일 14:00 가격을 찾습니다.
+                target_time = group.index[0].replace(hour=9, minute=0) # 현재 주의 시작점
+                
+                # 전체 데이터에서 target_time 이전의 금요일 14:00 데이터를 필터링
+                prior_data = close[close.index < target_time]
+                friday_2pm = prior_data[(prior_data.index.weekday == 4) & (prior_data.index.hour == 14)]
+                
+                if not friday_2pm.empty:
+                    return friday_2pm.iloc[-1] # 가장 최근 금요일 14:00 가격
+                else:
+                    return group.iloc[0] # 데이터가 없으면 현재 주 첫 가격 사용
 
-            monday_open_price = close.groupby(year_week).transform(get_first_valid)
+            # 주차별로 기준 가격 매핑
+            base_prices = close.groupby(year_week).apply(lambda x: get_friday_2pm_price(x))
             
-            # 월요일 아침 대비 상승률 (%)
-            ret = ((close - monday_open_price) / monday_open_price * 100)
-            
-            # 달러지수 가중치 (x5)
+            # 수익률 계산 (close 시리즈의 각 행에 해당하는 주차의 base_price 적용)
+            ret = close.copy()
+            for wk in year_week.unique():
+                mask = (year_week == wk)
+                ret[mask] = ((close[mask] - base_prices[wk]) / base_prices[wk] * 100)
+
+            # --- 이후 로직 동일 ---
             if sym == 'DX-Y.NYB': ret *= 5
             
-            # 실시간 수치 저장용
             latest_val = close.dropna().iloc[-1]
             latest_ret = ret.dropna().iloc[-1]
             current_stats[sym] = {'price': latest_val, 'ret': latest_ret}
-
             ret.name = sym
             combined_df.append(ret)
-        except: continue
-        
-    return pd.concat(combined_df, axis=1) if combined_df else None, current_stats
-
-def run_app():
-    st.title("📊 월요일 아침 대비 주간 상승률 (%)")
-    st.markdown("##### 🟦 삼성전자 강조 | ⬛ 월요일 0% 시작 | ✂️ 밤 시간/주말 삭제")
-
-    df, stats = get_weekly_performance_data()
-    if df is None:
-        st.error("데이터 로딩 실패")
-        return
-
-    fig = go.Figure()
-
-    # 종목 그리기 (삼성전자를 가장 마지막에 추가하여 레이어 최상단 배치)
-    plot_order = ['CL=F', 'DX-Y.NYB', 'SI=F', '005930.KS']
+            
+        except Exception as e:
+            continue
     
-    for sym in plot_order:
-        if sym in df.columns:
-            info = tickers_info[sym]
-            curr = stats.get(sym, {'price': 0, 'ret': 0})
-            
-            # 이름 옆에 [현재가격 | 월요일 대비 상승률] 표시
-            display_name = f"{info['name']} [{curr['price']:,.0f} | {curr['ret']:+.2f}%]"
-            
-            fig.add_trace(go.Scatter(
-                x=df.index, y=df[sym],
-                name=display_name,
-                line=dict(color=info['color'], width=info['width']),
-                connectgaps=True, # 밤 시간 공백을 직선으로 연결
-                hovertemplate=f"<b>{info['name']}</b><br>월요일대비: %{{y:.2f}}%<extra></extra>"
-            ))
-
-    # 기준선 (월요일 오전 9시 개장 시점 수직선)
-    monday_starts = df.index[(df.index.weekday == 0) & (df.index.hour == 9) & (df.index.minute == 0)]
-    for m_start in monday_starts:
-        fig.add_vline(x=m_start, line_width=2, line_color="black")
-
-    fig.update_layout(
-        hovermode="x unified",
-        height=800,
-        template="plotly_white",
-        xaxis=dict(
-            tickformat="%m/%d %H:%M",
-            rangebreaks=[
-                dict(bounds=["sat", "mon"]),           # 주말 삭제
-                dict(bounds=[15.5, 9], pattern="hour"), # 밤 시간(15:30~09:00) 삭제
-            ]
-        ),
-        yaxis=dict(
-            title="상승률 (기준: 월요일 시가 = 0%)",
-            range=[-20, 20],   # Y축 ±20% 고정
-            ticksuffix="%",
-            zeroline=True, zerolinewidth=3, zerolinecolor='black' # 0% 라인 강조
-        ),
-        legend=dict(orientation="h", y=1.05, x=0.5, xanchor="center", font=dict(size=13))
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-    st.info(f"💡 모든 지표는 해당 주의 월요일 첫 거래 가격을 0%로 잡고 계산되었습니다. (최종 업데이트: {df.index[-1].strftime('%H:%M:%S')})")
-
-if __name__ == "__main__":
-    run_app()
+    return pd.concat(combined_df, axis=1) if combined_df else (None, None), current_stats
