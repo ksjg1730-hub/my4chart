@@ -17,7 +17,7 @@ tickers_info = {
 
 @st.cache_data(ttl=30)
 def get_weekly_performance_data():
-    combined_df = []
+    combined_df_list = []
     current_stats = {}
     
     for sym, info in tickers_info.items():
@@ -26,8 +26,11 @@ def get_weekly_performance_data():
             df = yf.download(sym, period='1mo', interval='15m', progress=False)
             if df.empty: continue
             
-            close = df['Close'][sym] if isinstance(df.columns, pd.MultiIndex) else df['Close']
-            close = close.copy()
+            # 멀티인덱스 대응 및 Close 데이터 추출
+            if isinstance(df.columns, pd.MultiIndex):
+                close = df['Close'][sym].copy()
+            else:
+                close = df['Close'].copy()
             
             # 시간대 KST 변환
             if close.index.tz is None:
@@ -36,7 +39,6 @@ def get_weekly_performance_data():
                 close.index = close.index.tz_convert('Asia/Seoul')
 
             # --- [핵심] 월요일 아침 첫 가격 기준 수익률 계산 ---
-            # 연도-주차별로 그룹화하여 해당 주의 첫 번째 '유효한' 가격(시가)을 찾음
             year_week = close.index.strftime('%Y-%U')
             
             def get_first_valid(series):
@@ -57,10 +59,18 @@ def get_weekly_performance_data():
             current_stats[sym] = {'price': latest_val, 'ret': latest_ret}
 
             ret.name = sym
-            combined_df.append(ret)
+            combined_df_list.append(ret)
         except: continue
+    
+    if not combined_df_list:
+        return None, None
         
-    return pd.concat(combined_df, axis=1) if combined_df else None, current_stats
+    # --- [해결 포인트] 데이터 통합 및 빈 구간 채우기 ---
+    # 모든 종목을 하나의 시계열로 합친 후, 데이터가 없는 시간대를 직전 데이터로 채워 선을 잇습니다.
+    final_df = pd.concat(combined_df_list, axis=1)
+    final_df = final_df.ffill() # 삼성전자 개장 전 새벽 시간을 직전 주의 종가 데이터로 연결
+    
+    return final_df, current_stats
 
 def run_app():
     st.title("📊 월요일 아침 대비 주간 상승률 (%)")
@@ -88,7 +98,7 @@ def run_app():
                 x=df.index, y=df[sym],
                 name=display_name,
                 line=dict(color=info['color'], width=info['width']),
-                connectgaps=True, # 밤 시간 공백을 직선으로 연결
+                connectgaps=True, # 빈 구간 직선 연결 강제
                 hovertemplate=f"<b>{info['name']}</b><br>월요일대비: %{{y:.2f}}%<extra></extra>"
             ))
 
@@ -121,4 +131,4 @@ def run_app():
     st.info(f"💡 모든 지표는 해당 주의 월요일 첫 거래 가격을 0%로 잡고 계산되었습니다. (최종 업데이트: {df.index[-1].strftime('%H:%M:%S')})")
 
 if __name__ == "__main__":
-    run_app()
+    run_app()    run_app()
